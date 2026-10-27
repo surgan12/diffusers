@@ -1,6 +1,6 @@
 import torch
 
-from diffusers import DDPMScheduler
+from diffusers import DDPMParallelScheduler, DDPMScheduler
 
 from .test_schedulers import SchedulerCommonTest
 
@@ -36,6 +36,60 @@ class DDPMSchedulerTest(SchedulerCommonTest):
     def test_variance_type(self):
         for variance in ["fixed_small", "fixed_large", "other"]:
             self.check_over_configs(variance_type=variance)
+
+    def test_terminal_step_does_not_add_noise(self):
+        for scheduler_class in (DDPMScheduler, DDPMParallelScheduler):
+            for spacing in ("leading", "trailing", "custom"):
+                for variance_type in (
+                    "fixed_small",
+                    "fixed_small_log",
+                    "fixed_large",
+                    "fixed_large_log",
+                    "learned",
+                    "learned_range",
+                ):
+                    with self.subTest(scheduler=scheduler_class.__name__, spacing=spacing, variance=variance_type):
+                        scheduler = scheduler_class(
+                            variance_type=variance_type,
+                            timestep_spacing="leading" if spacing == "custom" else spacing,
+                            prediction_type="sample",
+                            clip_sample=False,
+                        )
+                        if spacing == "custom":
+                            scheduler.set_timesteps(timesteps=[999, 500])
+                        else:
+                            scheduler.set_timesteps(50)
+                        timestep = scheduler.timesteps[-1]
+                        self.assertEqual(int(scheduler.previous_timestep(timestep)), -1)
+
+                        sample = torch.zeros(1, 1, 2, 2)
+                        clean_sample = torch.full_like(sample, 0.25)
+                        model_output = clean_sample
+                        if variance_type in ("learned", "learned_range"):
+                            model_output = torch.cat([clean_sample, torch.ones_like(clean_sample)], dim=1)
+                        generator = torch.Generator().manual_seed(0)
+                        generator_state = generator.get_state().clone()
+                        result = scheduler.step(model_output, timestep, sample, generator=generator)
+
+                        torch.testing.assert_close(result.prev_sample, clean_sample, atol=1e-7, rtol=0)
+                        self.assertTrue(torch.equal(generator.get_state(), generator_state))
+
+    def test_transition_to_timestep_zero_still_adds_noise(self):
+        for scheduler_class in (DDPMScheduler, DDPMParallelScheduler):
+            with self.subTest(scheduler=scheduler_class.__name__):
+                scheduler = scheduler_class(variance_type="fixed_large", prediction_type="sample")
+                scheduler.set_timesteps(50)
+                timestep = scheduler.timesteps[-2]
+                self.assertEqual(int(scheduler.previous_timestep(timestep)), 0)
+                sample = torch.zeros(1, 1, 2, 2)
+                model_output = torch.full_like(sample, 0.25)
+                generator = torch.Generator().manual_seed(0)
+                generator_state = generator.get_state().clone()
+
+                result = scheduler.step(model_output, timestep, sample, generator=generator)
+
+                self.assertFalse(torch.equal(generator.get_state(), generator_state))
+                self.assertTrue(torch.isfinite(result.prev_sample).all())
 
     def test_clip_sample(self):
         for clip_sample in [True, False]:
